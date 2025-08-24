@@ -1,0 +1,15 @@
+praw           
+psycopg2-binary 
+python-dotenv  
+apscheduler  
+
+
+
+
+streamlit          
+pandas            
+scikit-learn       
+sentence-transformers 
+torch              
+hdbscan      
+ollama
