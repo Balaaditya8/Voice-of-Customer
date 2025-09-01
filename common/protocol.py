@@ -9,6 +9,5 @@ class MCPPacket(BaseModel):
     payload_type: str
     data: Dict[str, Any]
 
-    # Optional fields 
     session_id: Optional[str] = None
     trace_id: Optional[str] = None
