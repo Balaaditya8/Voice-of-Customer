@@ -11,5 +11,6 @@ pandas
 scikit-learn       
 sentence-transformers 
 torch              
-hdbscan      
 ollama
+redis
+pydantic

@@ -1,10 +1,9 @@
 import os
 import praw
-import psycopg2
+import redis
 import time
 from dotenv import load_dotenv
-from apscheduler.schedulers.blocking import BlockingScheduler
-
+from common.protocol import MCPPacket
 
 load_dotenv()
 
@@ -14,114 +13,66 @@ REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT")
 REDDIT_USERNAME = os.getenv("REDDIT_USERNAME")
 REDDIT_PASSWORD = os.getenv("REDDIT_PASSWORD")
 
-POSTGRES_DB = os.getenv("POSTGRES_DB")
-POSTGRES_USER = os.getenv("POSTGRES_USER")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
-
-def connect_to_db():
-    """Establishes a connection to the PostgreSQL database."""
-    time.sleep(5) 
-    try:
-        conn = psycopg2.connect(
-            host="localhost", 
-            dbname=POSTGRES_DB,
-            user=POSTGRES_USER,
-            password=POSTGRES_PASSWORD,
-            port=5432
-        )
-        return conn
-    except psycopg2.OperationalError as e:
-        print(f"Could not connect to database: {e}")
-        return None
-
-def create_table_if_not_exists(conn):
-    """Creates the 'feedback' table if it doesn't already exist."""
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS feedback (
-                id VARCHAR(20) PRIMARY KEY,
-                source VARCHAR(50) NOT NULL,
-                text_content TEXT NOT NULL,
-                author VARCHAR(100),
-                timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
-                url_to_source TEXT
-            );
-        """)
-        conn.commit()
-        print("Table 'feedback' is ready.")
-
-def insert_data(conn, data):
-    """Inserts a list of feedback data into the database, ignoring duplicates."""
-    with conn.cursor() as cur:
-        for item in data:
-            cur.execute("""
-                INSERT INTO feedback (id, source, text_content, author, timestamp, url_to_source)
-                VALUES (%s, %s, %s, %s, TO_TIMESTAMP(%s), %s)
-                ON CONFLICT (id) DO NOTHING;
-            """, (item['id'], item['source'], item['text_content'], item['author'], item['timestamp'], item['url_to_source']))
-        conn.commit()
-    print(f"Inserted {len(data)} new items into the database.")
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+RAW_FEEDBACK_CHANNEL = "raw_feedback_channel"
+PROCESSED_IDS_SET = "processed_reddit_ids"
 
 
-def fetch_reddit_data():
-    """Fetches data from a specified subreddit and returns it in a structured format."""
-    print("Initializing Reddit instance...")
-    reddit = praw.Reddit(
-        client_id=REDDIT_CLIENT_ID,
-        client_secret=REDDIT_CLIENT_SECRET,
-        user_agent=REDDIT_USER_AGENT,
-        username=REDDIT_USERNAME,
-        password=REDDIT_PASSWORD,
-    )
-
-    subreddit_name = 'Notion' 
-    limit = 25 
-
-    print(f"Fetching latest {limit} comments from r/{subreddit_name}...")
-    subreddit = reddit.subreddit(subreddit_name)
-    
-    fetched_data = []
-    for comment in subreddit.comments(limit=limit):
-        fetched_data.append({
-            'id': f"reddit_{comment.id}",
-            'source': 'Reddit',
-            'text_content': comment.body,
-            'author': comment.author.name if comment.author else '[deleted]',
-            'timestamp': comment.created_utc,
-            'url_to_source': f"https://www.reddit.com{comment.permalink}"
-        })
-    
-    print(f"Fetched {len(fetched_data)} comments.")
-    return fetched_data
-
-def run_job():
-    """The main function to be scheduled. It connects, fetches, and inserts."""
-    print("\n--- Starting new job run ---")
-    conn = connect_to_db()
-    if conn:
+def connect_to_redis_with_retry(host):
+    """Tries to connect to Redis, retrying until successful."""
+    print(f"Attempting to connect to Redis at {host}...")
+    while True:
         try:
-            create_table_if_not_exists(conn)
-            reddit_data = fetch_reddit_data()
-            if reddit_data:
-                insert_data(conn, reddit_data)
-        finally:
-            conn.close()
-            print("Database connection closed.")
-    else:
-        print("Skipping job run due to database connection failure.")
-    print("--- Job run finished ---")
+            r = redis.Redis(host=host, port=6379, db=0, decode_responses=True)
+            r.ping() # Check if the connection is alive
+            print("Successfully connected to Redis.")
+            return r
+        except redis.exceptions.ConnectionError as e:
+            print(f"Redis connection failed: {e}. Retrying in 5 seconds...")
+            time.sleep(5)
 
+def fetch_and_publish(redis_client, reddit_instance, subreddit_name='Notion', limit=20):
+    """Fetches new comments and publishes them as MCP packets to Redis."""
+    print(f"Fetching latest {limit} comments from r/{subreddit_name}...")
+    subreddit = reddit_instance.subreddit(subreddit_name)
+    
+    new_comments_published = 0
+    for comment in subreddit.comments(limit=limit):
+        if not redis_client.sismember(PROCESSED_IDS_SET, comment.id):
+            comment_data = {
+                'id': f"reddit_{comment.id}", 'source': 'Reddit', 'text_content': comment.body,
+                'author': comment.author.name if comment.author else '[deleted]',
+                'timestamp': comment.created_utc, 'url_to_source': f"https://www.reddit.com{comment.permalink}"
+            }
+            packet = MCPPacket(
+                source_agent="RedditListenerAgent", payload_type="raw_feedback", data=comment_data
+            )
+            redis_client.publish(RAW_FEEDBACK_CHANNEL, packet.model_dump_json())
+            redis_client.sadd(PROCESSED_IDS_SET, comment.id)
+            new_comments_published += 1
+    
+    if new_comments_published > 0:
+        print(f"Published {new_comments_published} new comments.")
 
 if __name__ == "__main__":
-    # To run the job immediately for testing, uncomment the next line:
-    run_job()
-
-    scheduler = BlockingScheduler()
-    # Schedule the job to run every hour
-    scheduler.add_job(run_job, 'interval', hours=1, next_run_time=None) # next_run_time=None ensures it runs on start
-    print("Scheduler started. First job will run immediately. Press Ctrl+C to exit.")
+    print("--- Reddit Listener Agent Starting Up ---")
     
-    try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    redis_client = connect_to_redis_with_retry(REDIS_HOST)
+
+    while True: 
+        try:
+            print("Initializing Reddit instance...")
+            reddit = praw.Reddit(
+                client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET,
+                user_agent=REDDIT_USER_AGENT, username=REDDIT_USERNAME, password=REDDIT_PASSWORD,
+            )
+            print("Successfully initialized Reddit instance.")
+            
+            while True:
+                fetch_and_publish(redis_client, reddit)
+                print(f"--- Sleeping for 15 minutes before next fetch (Local Time: {time.strftime('%Y-%m-%d %H:%M:%S')}) ---")
+                time.sleep(21600) 
+        
+        except Exception as e:
+            print(f"An error occurred in the main loop: {e}. Retrying in 60 seconds...")
+            time.sleep(60)
