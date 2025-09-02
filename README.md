@@ -5,6 +5,7 @@ This project is an end-to-end data pipeline that autonomously gathers unstructur
 The system is built on an event-driven, microservice-based architecture where specialized AI agents communicate asynchronously using a custom communication protocol (MCP) over a message bus.
 
 ## Demo
+![Dashboard Demo GIF](voc.gif)
 
 ## Features
 
